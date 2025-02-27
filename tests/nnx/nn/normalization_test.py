@@ -323,6 +323,59 @@ class TestLinenConsistency(parameterized.TestCase):
     assert isinstance(linen_out, jax.Array)
     np.testing.assert_array_equal(linen_out, nnx_out)
 
+  @parameterized.product(
+    dtype=[jnp.float32, jnp.float16],
+    param_dtype=[jnp.float32, jnp.float16],
+  )
+  def test_nnx_linen_weightnorm_equivalence(
+    self,
+    dtype: tp.Optional[Dtype],
+    param_dtype: Dtype,
+  ):
+    class NNXModel(nnx.Module):
+      def __init__(self, dtype, param_dtype, rngs):
+        self.linear = nnx.Linear(5, 4, dtype=dtype,
+                                 param_dtype=param_dtype, rngs=rngs)
+        self.norm_layer = nnx.WeightNorm(
+          self.linear,
+          dtype=dtype,
+          param_dtype=param_dtype,
+          rngs=rngs,
+        )
+
+      def __call__(self, x):
+        return self.norm_layer(x)
+
+    class LinenModel(linen.Module):
+      dtype: tp.Optional[Dtype] = None
+      param_dtype: Dtype = jnp.float32
+
+      def setup(self):
+        self.dense = linen.Dense(
+          4, dtype=self.dtype, param_dtype=self.param_dtype
+        )
+        self.norm_layer = linen.WeightNorm(self.dense)
+
+      def __call__(self, x):
+        return self.norm_layer(x)
+
+    rngs = nnx.Rngs(42)
+    x = jax.random.normal(jax.random.key(0), (10, 5))
+
+    linen_model = LinenModel(dtype=dtype, param_dtype=param_dtype)
+    variables = linen_model.init(jax.random.key(1), x)
+
+    nnx_model = NNXModel(
+      dtype=dtype, param_dtype=param_dtype, rngs=rngs
+    )
+    nnx_model.linear.kernel.value = variables['params']['dense']['kernel']
+    nnx_model.linear.bias.value = variables['params']['dense']['bias']
+
+    linen_out = linen_model.apply(variables, x)
+    nnx_out = nnx_model(x)
+    assert isinstance(linen_out, jax.Array)
+    np.testing.assert_array_equal(linen_out, nnx_out)
+
 
 if __name__ == '__main__':
   absltest.main()

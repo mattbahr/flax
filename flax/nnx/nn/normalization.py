@@ -181,6 +181,24 @@ def _normalize(
   return jnp.asarray(y, dtype)
 
 
+def _l2_normalize(x, axis=None, eps=1e-12):
+  """Normalizes along dimension `axis` using an L2 norm.
+
+  This specialized function exists for numerical stability reasons.
+
+  Args:
+    x: An input ndarray.
+    axis: Dimension along which to normalize, e.g. `1` to separately normalize
+      vectors in a batch. Passing `None` views `t` as a flattened vector when
+      calculating the norm (equivalent to Frobenius norm).
+    eps: Epsilon to avoid dividing by zero.
+
+  Returns:
+    An array of the same shape as 'x' L2-normalized along 'axis'.
+  """
+  return x * lax.rsqrt((x * x).sum(axis=axis, keepdims=True) + eps)
+
+
 class BatchNorm(Module):
   """BatchNorm Module.
 
@@ -836,3 +854,127 @@ class GroupNorm(Module):
       self.dtype,
       self.epsilon,
     )
+
+
+class WeightNorm(Module):
+  """L2 weight normalization (https://arxiv.org/abs/1602.07868).
+  Weight normalization normalizes the weight params so that the l2-norm of
+  the matrix is equal to 1. This is implemented as a layer wrapper where
+  each wrapped layer will have its params l2-normalized before computing
+  its ``__call__`` output.
+  Example usage::
+    >>> import jax
+    >>> import numpy as np
+    >>> from flax import nnx
+    >>> class Foo(nnx.Module):
+    ...   def __init__(self, rngs: nnx.Rngs):
+    ...     self.normed_linear = nnx.WeightNorm(
+    ...       nnx.Linear(8, 4, rngs=rngs),
+    ...       variable_filters=('kernel',),
+    ...       rngs=rngs,
+    ...     )
+    ...
+    ...   def __call__(self, x: jax.Array) -> jax.Array:
+    ...     return self.normed_linear(x)
+    >>> rng = jax.random.PRNGKey(42)
+    >>> model = Foo(rngs=nnx.Rngs(rng))
+    >>> x = jax.random.normal(rng, (5, 8))
+    >>> y = model(x)
+    >>> y.shape
+    (5, 4)
+    >>> w = model.normed_linear.layer_instance.kernel.value
+    >>> col_norms = np.linalg.norm(np.array(w), axis=0)
+    >>> np.testing.assert_allclose(col_norms, np.ones(4))
+
+  Args:
+    layer_instance: The layer instance to wrap.
+    epsilon: The epsilon value for the normalization, by default 1e-12.
+    dtype: The dtype of the result, by default infer from input and params.
+    param_dtype: The dtype of the parameters, by default float32.
+    use_scale: Whether to use a scale parameter.
+    scale_init: The initializer for the scale parameter, by default ones.
+    feature_axes: The axes to normalize.
+    variable_filters: The variable filter, by default ``('kernel',)``.
+    rngs: The rng key.
+  """
+  def __init__(
+    self,
+    layer_instance: Module,
+    *,
+    epsilon: float = 1e-12,
+    dtype: tp.Optional[Dtype] = None,
+    param_dtype: Dtype = jnp.float32,
+    use_scale: bool = True,
+    scale_init: Initializer = initializers.ones,
+    feature_axes: Axes | None = -1,
+    variable_filters: tuple[str, ...] | None = ('kernel',),
+    rngs: rnglib.Rngs,
+  ):
+    self.layer_instance = layer_instance
+    self.epsilon = epsilon
+    self.dtype = dtype
+    self.param_dtype = param_dtype
+    self.use_scale = use_scale
+    self.scale_init = scale_init
+    self.feature_axes = feature_axes
+    self.variable_filters = variable_filters
+    self.rngs = rngs
+
+  def __call__(self, x, *args, **kwargs):
+    """Compute the l2-norm of the weights in ``self.layer_instance``
+    and normalize the weights using this value before computing the
+    ``__call__`` output.
+    Args:
+      *args: positional arguments to be passed into the call method of the
+        underlying layer instance in ``self.layer_instance``.
+      **kwargs: keyword arguments to be passed into the call method of the
+        underlying layer instance in ``self.layer_instance``.
+    Returns:
+      Output of the layer using l2-normalized weights.
+    """
+    if self.variable_filters is None:
+      state = nnx.state(self.layer_instance)
+    else:
+      state = nnx.state(self.layer_instance,
+                        [nnx.PathContains(filter) for filter in self.variable_filters])
+
+    def apply_weight_norm(path, vs):
+      value = jnp.asarray(vs.value)
+
+      if self.feature_axes is None:
+        feature_axes = ()
+        reduction_axes = tuple(range(value.ndim))
+      else:
+        feature_axes = _canonicalize_axes(value.ndim, self.feature_axes)
+        reduction_axes = tuple(
+          i for i in range(value.ndim) if i not in feature_axes
+        )
+
+      feature_shape = [1] * value.ndim
+      reduced_feature_shape = []
+      for ax in feature_axes:
+        feature_shape[ax] = value.shape[ax]
+        reduced_feature_shape.append(value.shape[ax])
+
+      value_bar = _l2_normalize(value, axis=reduction_axes, eps=self.epsilon)
+      dtargs = [vs.value]
+
+      if self.use_scale:
+        scale_path = '/'.join(str(k) for k in path) + '/scale'
+        if state.__contains__(scale_path):
+          scale = jnp.asarray(state.__getitem__(scale_path).value)
+          scale = scale.reshape(feature_shape)
+        else:
+          scale = self.scale_init(self.rngs.params(),
+                                  reduced_feature_shape,
+                                  self.param_dtype).reshape(feature_shape)
+        value_bar *= scale
+        dtargs.append(scale)
+
+      dtype = dtypes.canonicalize_dtype(*dtargs, dtype=self.dtype)
+      return nnx.Param(jnp.asarray(value_bar, dtype))
+
+    state = nnx.map_state(apply_weight_norm, state)
+    nnx.update(self.layer_instance, state)
+
+    return self.layer_instance(x, *args, **kwargs)
