@@ -1205,36 +1205,29 @@ class InstanceNorm(Module):
     >>> from flax import nnx
     >>> import jax
     >>> import numpy as np
-    ...
-    >>> x = jax.random.normal(jax.random.key(0), (3, 4, 5, 6))
-    >>> layer = nnx.InstanceNorm(num_features=6, rngs=nnx.Rngs(0))
-    >>> nnx.state(layer)
+
+    >>> # dimensions: (batch, height, width, channel)
+    >>> x = jax.random.normal(jax.random.key(0), (2, 3, 4, 5))
+    >>> layer = nnx.InstanceNorm(5, rngs=nnx.Rngs(0))
+    >>> nnx.state(layer, nnx.OfType(nnx.Param))
     State({
-      'bias': VariableState( # 6 (24 B)
+      'bias': VariableState( # 5 (20 B)
         type=Param,
-        value=Array([0., 0., 0., 0., 0., 0.], dtype=float32)
+        value=Array([0., 0., 0., 0., 0.], dtype=float32)
       ),
-      'rngs': {
-        'default': {
-          'count': VariableState( # 1 (4 B)
-            type=RngCount,
-            value=Array(2, dtype=uint32),
-            tag='default'
-          ),
-          'key': VariableState( # 1 (8 B)
-            type=RngKey,
-            value=Array((), dtype=key<fry>) overlaying:
-            [0 0],
-            tag='default'
-          )
-        }
-      },
-      'scale': VariableState( # 6 (24 B)
+      'scale': VariableState( # 5 (20 B)
         type=Param,
-        value=Array([1., 1., 1., 1., 1., 1.], dtype=float32)
+        value=Array([1., 1., 1., 1., 1.], dtype=float32)
       )
     })
     >>> y = layer(x)
+
+    >>> # having a channel_axis of -1 in InstanceNorm is identical to reducing all non-batch,
+    >>> # non-channel axes and using the feature_axes as the feature_axes in LayerNorm
+    >>> y2 = nnx.LayerNorm(5, reduction_axes=[1, 2], feature_axes=-1, rngs=nnx.Rngs(0))(x)
+    >>> np.testing.assert_allclose(y, y2, atol=1e-7)
+    >>> y3 = nnx.GroupNorm(5, num_groups=x.shape[-1], rngs=nnx.Rngs(0))(x)
+    >>> np.testing.assert_allclose(y, y3, atol=1e-7)
 
   Attributes:
     num_features: the number of input features/channels.
