@@ -418,11 +418,12 @@ class TestLinenConsistency(parameterized.TestCase):
           n_steps=n_steps,
           dtype=dtype,
           param_dtype=param_dtype,
+          update_stats=update_stats,
           rngs=rngs,
         )
 
       def __call__(self, x):
-        return self.norm_layer(x, update_stats=update_stats)
+        return self.norm_layer(x)
 
     class LinenModel(linen.Module):
       dtype: tp.Optional[Dtype] = None
@@ -449,14 +450,9 @@ class TestLinenConsistency(parameterized.TestCase):
     nnx_model.linear.kernel.value = variables['params']['dense']['kernel']
     nnx_model.linear.bias.value = variables['params']['dense']['bias']
 
-    linear_state = nnx.state(nnx_model.linear)
-    linear_state['batch_stats/kernel/u'] = nnx.Param(
-      variables['batch_stats']['norm_layer']['dense/kernel/u']
-    )
-    linear_state['batch_stats/kernel/sigma'] = nnx.Param(
-      variables['batch_stats']['norm_layer']['dense/kernel/sigma']
-    )
-    nnx.update(nnx_model.linear, linear_state)
+    var_norm_layer = variables['batch_stats']['norm_layer']
+    nnx_model.norm_layer.batch_stats[("kernel", "u")].value = var_norm_layer['dense/kernel/u']
+    nnx_model.norm_layer.batch_stats[("kernel", "sigma")].value = var_norm_layer['dense/kernel/sigma']
 
     linen_out = linen_model.apply(variables, x, mutable=['batch_stats'])
     nnx_out = nnx_model(x)

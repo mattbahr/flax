@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import typing as tp
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -862,6 +863,7 @@ class InstanceNorm(Module):
   Normalization). i.e. applies a transformation that maintains the mean activation
   within each channel within each example close to 0 and the activation standard
   deviation close to 1.
+
   .. note::
     This normalization operation is identical to LayerNorm and GroupNorm; the
     difference is simply which axes are reduced and the shape of the feature axes
@@ -1013,7 +1015,9 @@ class InstanceNorm(Module):
 
 class SpectralNorm(Module):
   """Spectral normalization.
+
   See:
+
   - https://arxiv.org/abs/1802.05957
   - https://arxiv.org/abs/1805.08318
   - https://arxiv.org/abs/1809.11096
@@ -1022,6 +1026,7 @@ class SpectralNorm(Module):
   norm of the matrix is equal to 1. This is implemented as a layer wrapper
   where each wrapped layer will have its params spectral normalized before
   computing its ``__call__`` output.
+
   .. note::
     The initialized variables dict will contain, in addition to a 'params'
     collection, a separate 'batch_stats' collection that will contain a
@@ -1071,9 +1076,9 @@ class SpectralNorm(Module):
       higher-order tensors in their leading dimensions. Setting this flag to
       True will instead throw an error if a weight tensor with dimension greater
       than 2 is used by the layer.
-    collection_name: Name of the collection to store intermediate values used
-      when performing spectral normalization.
-    rngs: The rng key.
+    update_stats: if True, the stored batch statistics will be
+      used instead of computing the batch statistics on the input.
+    rngs: rng key.
   """
 
   def __init__(
@@ -1085,7 +1090,7 @@ class SpectralNorm(Module):
     dtype: tp.Optional[Dtype] = None,
     param_dtype: Dtype = jnp.float32,
     error_on_non_matrix: bool = False,
-    collection_name: str = 'batch_stats',
+    update_stats: bool = False,
     rngs: rnglib.Rngs,
   ):
     self.layer_instance = layer_instance
@@ -1094,98 +1099,113 @@ class SpectralNorm(Module):
     self.dtype = dtype
     self.param_dtype = param_dtype
     self.error_on_non_matrix = error_on_non_matrix
-    self.collection_name = collection_name
-    self.rngs = rngs
 
-  def __call__(self, x, *args, update_stats: bool, **kwargs):
+    self.use_running_average = update_stats
+
+    # Initialize batch stat variables:
+    state = nnx.state(self.layer_instance)
+
+    self.batch_stats: dict[tuple, nnx.BatchStat] = nnx.data({})
+    def init_batch_stats(path, param):
+      if param.ndim <= 1 or self.n_steps < 1:
+        return
+      elif param.ndim > 2:
+        if self.error_on_non_matrix:
+          raise ValueError(
+            f'Layer instance parameter is {param.ndim}D but error_on_non_matrix is True'
+          )
+        else:
+          param = jnp.reshape(param, (-1, param.shape[-1]))
+
+      path_u = path + ("u", )
+      path_sigma = path + ("sigma", )
+
+      key = rngs.params()
+      self.batch_stats[path_u] = nnx.BatchStat(
+        initializers.normal()(key, (1, param.shape[-1]), self.param_dtype)
+      )
+      key = rngs.params()
+      self.batch_stats[path_sigma] = nnx.BatchStat(
+        initializers.ones(key, (), self.param_dtype)
+      )
+
+    nnx.map_state(init_batch_stats, state)
+
+  def __call__(
+    self,
+    x,
+    update_stats: tp.Optional[bool] = None,
+  ):
     """Compute the largest singular value of the weights in ``self.layer_instance``
     using power iteration and normalize the weights using this value before
     computing the ``__call__`` output.
 
     Args:
       x: the input array of the nested layer
-      *args: positional arguments to be passed into the call method of the
-        underlying layer instance in ``self.layer_instance``.
       update_stats: if True, update the internal ``u`` vector and ``sigma``
         value after computing their updated values using power iteration. This
         will help the power iteration method approximate the true singular value
         more accurately over time.
-      **kwargs: keyword arguments to be passed into the call method of the
-        underlying layer instance in ``self.layer_instance``.
 
     Returns:
       Output of the layer using spectral normalized weights.
     """
-
+    update_stats = first_from(
+      update_stats,
+      self.use_running_average,
+      error_msg="""No `update_stats` argument was provided to SpectralNorm
+        as either a __call__ argument or __init__ argument.""",
+    )
     state = nnx.state(self.layer_instance)
-
-    def spectral_normalize(path, vs):
-      value = jnp.asarray(vs.value)
-      value_shape = value.shape
-
-      # Skip and return value if input is scalar, vector or if number of power
-      # iterations is less than 1
-      if value.ndim <= 1 or self.n_steps < 1:
-        return value
-      # Handle higher-order tensors.
-      elif value.ndim > 2:
-        if self.error_on_non_matrix:
-          raise ValueError(
-            f'Input is {value.ndim}D but error_on_non_matrix is set to True'
-          )
-        else:
-          value = jnp.reshape(value, (-1, value.shape[-1]))
-
-      u_var_name = (
-        self.collection_name
-        + '/'
-        + '/'.join(str(k) for k in path)
-        + '/u'
-      )
-
-      try:
-        u = state[u_var_name].value
-      except KeyError:
-        u = jax.random.normal(
-          self.rngs.params(),
-          (1, value.shape[-1]),
-          self.param_dtype,
-        )
-
-      sigma_var_name = (
-        self.collection_name
-        + '/'
-        + '/'.join(str(k) for k in path)
-        + '/sigma'
-      )
-
-      try:
-        sigma = state[sigma_var_name].value
-      except KeyError:
-        sigma = jnp.ones((), self.param_dtype)
-
-      for _ in range(self.n_steps):
-        v = _l2_normalize(
-          jnp.matmul(u, value.transpose([1, 0])), eps=self.epsilon
-        )
-        u = _l2_normalize(jnp.matmul(v, value), eps=self.epsilon)
-
-      u = lax.stop_gradient(u)
-      v = lax.stop_gradient(v)
-
-      sigma = jnp.matmul(jnp.matmul(v, value), jnp.transpose(u))[0, 0]
-
-      value /= jnp.where(sigma != 0, sigma, 1)
-      value_bar = value.reshape(value_shape)
-
-      if update_stats:
-        state[u_var_name] = nnx.Param(u)
-        state[sigma_var_name] = nnx.Param(sigma)
-
-      dtype = dtypes.canonicalize_dtype(vs.value, u, v, sigma, dtype=self.dtype)
-      return vs.replace(jnp.asarray(value_bar, dtype))
-
-    state = nnx.map_state(spectral_normalize, state)
+    state = nnx.map_state(
+      partial(self._spectral_normalize, update_stats=update_stats),
+      state,
+    )
     nnx.update(self.layer_instance, state)
+    return self.layer_instance(x)
 
-    return self.layer_instance(x, *args, **kwargs)  # type: ignore
+  def _spectral_normalize(self, path, param, update_stats):
+    param_shape = param.shape
+    if param.ndim <= 1 or self.n_steps < 1:
+      return param
+    elif param.ndim > 2:
+      if self.error_on_non_matrix:
+        raise ValueError(
+          f'Layer instance parameter is {param.ndim}D but error_on_non_matrix is True'
+        )
+      else:
+        param = jnp.reshape(param, (-1, param.shape[-1]))
+
+    path_u = path + ("u", )
+    path_sigma = path + ("sigma", )
+
+    if path_u not in self.batch_stats:
+      raise RuntimeError(
+        f"Could not find the path for u batch stat corresponding to the param {path} "
+        "in the batch stats dict. Parameters of the layer_instance should not change!"
+      )
+    if path_sigma not in self.batch_stats:
+      raise RuntimeError(
+        f"Could not find the path for sigma batch stat corresponding to the param {path} "
+        "in the batch stats dict. Parameters of the layer_instance should not change!"
+      )
+
+    u = self.batch_stats[path_u].value
+
+    for _ in range(self.n_steps):
+      v = _l2_normalize(jnp.matmul(u, param.T), eps=self.epsilon)
+      u = _l2_normalize(jnp.matmul(v, param), eps=self.epsilon)
+
+    u = lax.stop_gradient(u)
+    v = lax.stop_gradient(v)
+
+    sigma = jnp.matmul(jnp.matmul(v, param), u.T)[0, 0]
+    param /= jnp.where(sigma != 0, sigma, 1)
+    param = param.reshape(param_shape)
+
+    if update_stats:
+      self.batch_stats[path_u][...] = u
+      self.batch_stats[path_sigma][...] = sigma
+
+    dtype = dtypes.canonicalize_dtype(param, u, v, sigma, dtype=self.dtype)
+    return jnp.asarray(param, dtype)
